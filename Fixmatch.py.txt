@@ -1,0 +1,124 @@
+import tensorflow as tf
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer, TFAutoModel
+import numpy as np
+import random
+from google.colab import drive
+
+# Mount Google Drive to access the dataset
+drive.mount('/content/drive')
+
+# Load dataset from CSV (replace this with the actual path to your dataset)
+data = pd.read_csv('/content/drive/MyDrive/ICCIT2023/paper.csv')
+
+# Extract text and labels
+texts = data['Text'].tolist()
+labels = data['Sub-task A'].tolist()
+
+# Load Bangla BERT tokenizer
+tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/banglabert")
+
+# Tokenize the texts and get token ids
+def preprocess_texts(texts, max_len=128):
+    return tokenizer(texts, truncation=True, padding='max_length', max_length=max_len, return_tensors="tf")
+
+# Preprocess the texts into token ids
+tokenized_data = preprocess_texts(texts)
+tokenized_texts = tokenized_data['input_ids'].numpy()
+attention_masks = tokenized_data['attention_mask'].numpy()
+
+# Split dataset into labeled and unlabeled sets
+labeled_size = int(0.6 * len(tokenized_texts))  # 60% labeled, 40% unlabeled
+X_labeled, X_unlabeled = tokenized_texts[:labeled_size], tokenized_texts[labeled_size:]
+mask_labeled, mask_unlabeled = attention_masks[:labeled_size], attention_masks[labeled_size:]
+y_labeled, _ = labels[:labeled_size], labels[labeled_size:]  # We don't use labels for the unlabeled data
+
+# Split the labeled set into train and test sets
+X_train, X_test, mask_train, mask_test, y_train, y_test = train_test_split(
+    X_labeled, mask_labeled, y_labeled, test_size=0.2, random_state=42)
+
+print(f"Labeled Training Data Size: {len(X_train)}")
+print(f"Unlabeled Data Size: {len(X_unlabeled)}")
+
+# Custom Keras Layer to wrap Bangla BERT
+class BertEmbeddingLayer(tf.keras.layers.Layer):
+    def __init__(self, model_name):
+        super(BertEmbeddingLayer, self).__init__()
+        # Load the Bangla BERT model from Huggingface with PyTorch weights
+        self.bert_model = TFAutoModel.from_pretrained(model_name, from_pt=True)
+
+    def call(self, inputs):
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        outputs = self.bert_model(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.last_hidden_state[:, 0, :]  # CLS token representation
+
+# Build FixMatch model
+def build_fixmatch_model(input_shape, num_classes):
+    input_ids = tf.keras.Input(shape=(input_shape,), dtype=tf.int32, name='input_ids')
+    attention_mask = tf.keras.Input(shape=(input_shape,), dtype=tf.int32, name='attention_mask')
+    
+    # Use the custom BertEmbeddingLayer
+    bert_output = BertEmbeddingLayer("csebuetnlp/banglabert")({'input_ids': input_ids, 'attention_mask': attention_mask})
+    
+    # Add Dense layers for classification
+    x = tf.keras.layers.Dense(256, activation='relu')(bert_output)
+    outputs = tf.keras.layers.Dense(num_classes, activation='softmax')(x)
+    
+    model = tf.keras.Model(inputs=[input_ids, attention_mask], outputs=outputs)
+    return model
+
+# Build the FixMatch model
+input_shape = 128  # Assuming tokenized input length is 128
+num_classes = 2  # Binary classification
+model = build_fixmatch_model(input_shape, num_classes)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# Weak and Strong Augmentation Functions for Text
+def weak_augmentation(text):
+    # Simulate weak augmentation by token masking or slight perturbations
+    mask_idx = random.randint(0, len(text)-1)
+    text[mask_idx] = tokenizer.mask_token_id  # Replace a token with [MASK]
+    return text
+
+def strong_augmentation(text):
+    # Simulate stronger augmentation by shuffling tokens or using more aggressive perturbations
+    random.shuffle(text)
+    return text
+
+# Pseudo-labeling and consistency loss
+confidence_threshold = 0.95  # Confidence threshold for pseudo-labeling
+
+# FixMatch training loop
+for epoch in range(3):  # Train for 3 epochs
+    print(f"Epoch {epoch+1}/3")
+    
+    # Step 1: Train on labeled data
+    history = model.fit(
+        {'input_ids': X_train, 'attention_mask': mask_train},
+        np.array(y_train),
+        validation_data=({'input_ids': X_test, 'attention_mask': mask_test}, np.array(y_test)),
+        epochs=1,
+        batch_size=16
+    )
+
+    # Step 2: Pseudo-label and train on unlabeled data
+    for i in range(len(X_unlabeled)):
+        weak_text = weak_augmentation(list(X_unlabeled[i]))
+        strong_text = strong_augmentation(list(X_unlabeled[i]))
+
+        weak_pred = model.predict({'input_ids': np.array([weak_text]), 'attention_mask': np.array([mask_unlabeled[i]])})
+        weak_confidence = np.max(weak_pred)
+        pseudo_label = np.argmax(weak_pred)
+
+        if weak_confidence >= confidence_threshold:
+            model.train_on_batch(
+                {'input_ids': np.array([strong_text]), 'attention_mask': np.array([mask_unlabeled[i]])},
+                np.array([pseudo_label])
+            )
+
+# Evaluate the model on the labeled test set
+test_loss, test_acc = model.evaluate({'input_ids': X_test, 'attention_mask': mask_test}, np.array(y_test))
+print(f"Test Accuracy: {test_acc}")
