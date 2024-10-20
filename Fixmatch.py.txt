@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 from scipy import sparse
 from google.colab import drive
 
@@ -42,19 +43,25 @@ y = data['Sub-task A']
 tfidf_vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
 text_features = tfidf_vectorizer.fit_transform(X)
 
-# Split the data into labeled and unlabeled data
-n_labeled = int(0.2 * len(data))  # 20% of the data is labeled
-train_texts = text_features[:n_labeled]
-train_labels = y[:n_labeled].values
+# Split the data into training and testing sets (80% train, 20% test)
+train_texts, test_texts, train_labels, test_labels = train_test_split(text_features, y, test_size=0.2, random_state=42)
 
-unlabeled_texts = text_features[n_labeled:]
+# Further split the training data into labeled (20%) and unlabeled (80%)
+n_labeled = int(0.2 * train_texts.shape[0])  # 20% of the training data is labeled
+
+labeled_texts = train_texts[:n_labeled]
+labeled_labels = train_labels[:n_labeled].values
+
+unlabeled_texts = train_texts[n_labeled:]
 
 # Create PyTorch Datasets and DataLoaders
-train_dataset = TextDataset(train_texts, train_labels)
+labeled_dataset = TextDataset(labeled_texts, labeled_labels)
 unlabeled_dataset = TextDataset(unlabeled_texts)
+test_dataset = TextDataset(test_texts, test_labels.values)
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+labeled_loader = DataLoader(labeled_dataset, batch_size=32, shuffle=True)
 unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 # FixMatch Model Definition
 class FixMatchModel(nn.Module):
@@ -82,12 +89,12 @@ optimizer = optim.Adam(fixmatch_model.parameters(), lr=0.001)
 criterion = nn.CrossEntropyLoss()
 
 # FixMatch Training Function
-def train_fixmatch(model, optimizer, train_loader, unlabeled_loader, num_epochs=10):
+def train_fixmatch(model, optimizer, labeled_loader, unlabeled_loader, num_epochs=10):
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0
         print(f"Starting Epoch {epoch + 1}/{num_epochs}")
-        for (x_labeled, y_labeled), (x_unlabeled, _) in zip(train_loader, unlabeled_loader):
+        for (x_labeled, y_labeled), (x_unlabeled, _) in zip(labeled_loader, unlabeled_loader):
             # Convert labels to LongTensor
             y_labeled = y_labeled.long()
 
@@ -102,22 +109,15 @@ def train_fixmatch(model, optimizer, train_loader, unlabeled_loader, num_epochs=
 
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = total_loss / len(labeled_loader)
         print(f"Epoch {epoch + 1} Completed. Average Loss: {avg_loss:.4f}")
 
 # Train the FixMatch model
 print("Training the FixMatch model...")
-train_fixmatch(fixmatch_model, optimizer, train_loader, unlabeled_loader)
+train_fixmatch(fixmatch_model, optimizer, labeled_loader, unlabeled_loader)
 print("Training completed!")
 
-# Prepare test set (using full data for simplicity)
-test_texts = text_features
-test_labels = y.values
-
-test_dataset = TextDataset(test_texts, test_labels)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-# Evaluate the model
+# Evaluate the model on the test set
 def evaluate_model(model, test_loader):
     model.eval()
     all_preds = []
@@ -130,12 +130,10 @@ def evaluate_model(model, test_loader):
             all_labels.extend(y.cpu().numpy())
     return all_labels, all_preds
 
-print("Evaluating the model...")
+print("Evaluating the model on test set...")
 all_labels, all_preds = evaluate_model(fixmatch_model, test_loader)
 
 # Print evaluation results
-from sklearn.metrics import classification_report, confusion_matrix
-
 from sklearn.metrics import classification_report, confusion_matrix
 
 print("Classification Report:")
@@ -155,4 +153,3 @@ plt.title('Confusion Matrix')
 plt.xlabel('Predicted Labels')
 plt.ylabel('True Labels')
 plt.show()
-
