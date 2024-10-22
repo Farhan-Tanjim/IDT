@@ -1,2 +1,2 @@
 # IDT
-Applying supervised(CNN-BiLSTM) and semi-supervised(FIXMATCH) models on a dataset
+Applying supervised(CNN-BiLSTM) and semi-supervised(FIXMATCH, GAN) models on a dataset
